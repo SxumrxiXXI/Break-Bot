@@ -453,15 +453,16 @@ def handle_break(ack, body):
     qc     = queue_count() - 1  # subtract self just inserted
 
     if active is None and qc == 0:
+        # Slot is free — start immediately, no button needed
+        run("UPDATE breaks SET status='queued' WHERE id=?", bid)
         dm(
-            f"📥 *Break Requested*\n"
+            f"📥 *Break Started Immediately*\n"
             f"  • *Employee:* {name}\n"
             f"  • *Duration:* {mins} min\n"
-            f"  • *Slot:* Free — notifying now\n"
-            f"  • *Minutes used today:* {minutes_used_today(user):.0f}/{cfg('daily_minutes')}\n"
+            f"  • *Minutes used today:* {int(minutes_used_today(user))}/{cfg('daily_minutes')}\n"
             f"  • *Time:* {now_str()}"
         )
-        notify_next(bid)
+        start_break(bid)
     else:
         pos = (1 if active else 0) + qc + 1
         ephemeral(
@@ -603,8 +604,44 @@ def handle_status(ack, body):
 
 
 # ── Slash command: /mybreakid (debug) ────────────────────────────────────────
-@app.command("/mybreakid")
-def handle_mybreakid(ack, body):
+@app.command("/breakhelp")
+def handle_help(ack, body):
+    ack()
+    user = body["user_id"]
+    is_manager = user == MANAGER_USER_ID
+
+    employee_cmds = (
+        "*👤 Employee Commands:*\n"
+        "  • `/break 15` — Start a 15-min break immediately (or join queue if someone's out)\n"
+        "  • `/break 10` — Same but 10 mins (any number works)\n"
+        "  • `/break` — Defaults to 15 min if no number given\n"
+        "\n"
+        "*🔘 Buttons (appear in channel):*\n"
+        "  • *▶️ Start My Break* — Claim your queued turn (2-min window)\n"
+        "  • *🔚 End Break Early* — End your break instantly, logs actual time\n"
+        "  • *✅ I'm Back!* — Confirm you're back after timer ends\n"
+    )
+
+    manager_cmds = (
+        "\n*🔐 Manager-Only Commands:*\n"
+        "  • `/breakstatus` — Dashboard: who's out, queue, everyone's minutes today\n"
+        "  • `/setminutes 60` — Set daily break allowance (in minutes) for all employees\n"
+        "  • `/resetbreaks` — Wipe today's break minutes, everyone starts fresh\n"
+        "  • `/clearqueue` — Force-clear all active breaks and queue entries\n"
+        "  • `/breakhelp` — Show this help message\n"
+        "\n"
+        "*🗑 Commands you can delete in Slack API settings (not used):*\n"
+        "  • `/mybreakid` — Was a debug tool, no longer needed\n"
+        "  • `/setlimit` — Old count-based limit, replaced by `/setminutes`\n"
+    )
+
+    text = employee_cmds + (manager_cmds if is_manager else "")
+    app.client.chat_postEphemeral(
+        channel=body["channel_id"],
+        user=user,
+        text=text,
+        mrkdwn=True
+    )
     ack()
     user    = body["user_id"]
     channel = body["channel_id"]
@@ -662,7 +699,42 @@ def handle_end_early(ack, body, action):
     t = active_timers.pop(brk_id, None)
     if t:
         t.cancel()
-    end_break(brk_id, early=True)
+    # Log it immediately — no I'm Back step needed
+    ended    = time.time()
+    started  = brk["started_at"] or ended
+    duration = ended - started
+    run(
+        "UPDATE breaks SET status='completed', ended_at=?, duration_sec=? WHERE id=?",
+        ended, duration, brk_id
+    )
+    uid      = brk["employee_id"]
+    name     = username(uid)
+    dur_str  = fmt_dur(duration)
+    remaining = minutes_remaining_today(uid)
+
+    if brk["channel_msg_ts"]:
+        update_msg(
+            brk["channel_msg_ts"],
+            f"✅ <@{uid}> ended their break early and is back.",
+            blocks=[{
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"✅ <@{uid}> is back early. 👋"}
+            }]
+        )
+    ephemeral(uid,
+        f"👋 Break ended early!\n"
+        f"  • *Time taken:* {dur_str}\n"
+        f"  • *Minutes remaining today:* {remaining:.0f} min"
+    )
+    dm(
+        f"🔚 *Break Ended Early*\n"
+        f"  • *Employee:* {name}\n"
+        f"  • *Time taken:* {dur_str}\n"
+        f"  • *Minutes used today:* {minutes_used_today(uid):.0f}/{cfg('daily_minutes')}\n"
+        f"  • *Minutes remaining today:* {remaining:.0f} min\n"
+        f"  • *Time:* {now_str()}"
+    )
+    promote_queue()
 
 
 # ── Button: I'm Back ─────────────────────────────────────────────────────────
