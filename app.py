@@ -284,14 +284,17 @@ def complete_break(brk_id, clicked_by):
 
 
 def notify_next(brk_id):
+    print(f"[notify_next] called for break_id={brk_id}")
     brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
     if not brk:
+        print(f"[notify_next] break not found!")
         return
     run(
         "UPDATE breaks SET status='notified', notified_at=unixepoch() WHERE id=?",
         brk_id
     )
     name = username(brk["employee_id"])
+    print(f"[notify_next] posting to channel {BREAK_CHANNEL_ID} for {name}")
 
     blocks = [
         {
@@ -316,6 +319,7 @@ def notify_next(brk_id):
         }
     ]
     ts = post(f"🟢 {name}, it's your turn!", blocks=blocks)
+    print(f"[notify_next] post returned ts={ts}")
     if ts:
         run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
 
@@ -404,6 +408,7 @@ def handle_break(ack, body):
         return
 
     name = username(user)
+    print(f"[/break] user={user} name={name} active={active_break()} qc={queue_count()}")
     run("INSERT INTO breaks (employee_id, status) VALUES (?,?)", user, "queued")
     bid = last_id()
 
