@@ -127,8 +127,20 @@ def post(text, blocks=None):
     kw = {"channel": BREAK_CHANNEL_ID, "text": text}
     if blocks:
         kw["blocks"] = blocks
-    r = app.client.chat_postMessage(**kw)
-    return r["ts"]
+    try:
+        r = app.client.chat_postMessage(**kw)
+        return r["ts"]
+    except Exception as e:
+        err = str(e)
+        print(f"[post error] {err}")
+        try:
+            app.client.chat_postMessage(
+                channel=MANAGER_USER_ID,
+                text=f"⚠️ *Bot channel post failed:* `{err}`\nMake sure the bot is invited: `/invite @Break Bot` in the channel."
+            )
+        except Exception:
+            pass
+        return None
 
 def update_msg(ts, text, blocks=None):
     kw = {"channel": BREAK_CHANNEL_ID, "ts": ts, "text": text}
@@ -165,7 +177,8 @@ def start_break(brk_id):
             }
         }]
     )
-    run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
+    if ts:
+        run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
 
     used = breaks_today(brk["employee_id"])
     qc = queue_count()
@@ -303,7 +316,8 @@ def notify_next(brk_id):
         }
     ]
     ts = post(f"🟢 {name}, it's your turn!", blocks=blocks)
-    run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
+    if ts:
+        run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
 
     dm(
         f"🔔 *Queue: Next Person Notified*\n"
