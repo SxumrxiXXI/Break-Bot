@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Break Queue Bot v2
+Break Queue Bot v3
 ──────────────────
-• Employees use /break slash command
-• Auto-approve with queue (1 person on break at a time)
-• Fixed 15-minute breaks
-• "I'm Back" button when break ends
-• 2-minute window to accept queued turn
+• Minutes-based daily allowance (e.g. 60 mins/day total)
+• Employee types /break 15  (requests 15 mins)
+• Channel posts are minimal — just tag the person + buttons, no duration shown
+• Manager gets full details via DM
+• Employee gets private ephemeral showing their remaining minutes
+• "End Break Early" button on active break message
+• "I'm Back" button when timer ends
+• 2-min window to accept queued turn
 • Daily reset at midnight
-• Real-time detailed DMs to manager
-• Manager commands: /setlimit N  /resetbreaks  /breakstatus
+• Manager commands: /setminutes  /resetbreaks  /clearqueue  /breakstatus
 """
 
 import os, sqlite3, threading, time, schedule
@@ -18,11 +20,10 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BREAK_CHANNEL_ID    = os.environ["BREAK_CHANNEL_ID"]
-MANAGER_USER_ID     = os.environ["MANAGER_USER_ID"]
-BREAK_DURATION_SECS = 15 * 60
-QUEUE_TIMEOUT_SECS  = 120
-DB_PATH             = "breaks.db"
+BREAK_CHANNEL_ID   = os.environ["BREAK_CHANNEL_ID"]
+MANAGER_USER_ID    = os.environ["MANAGER_USER_ID"]
+QUEUE_TIMEOUT_SECS = 120
+DB_PATH            = "breaks.db"
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 active_timers: dict = {}
@@ -35,6 +36,7 @@ def init_db():
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 employee_id    TEXT    NOT NULL,
                 status         TEXT    NOT NULL DEFAULT 'queued',
+                requested_mins INTEGER NOT NULL DEFAULT 15,
                 started_at     REAL,
                 ended_at       REAL,
                 duration_sec   REAL,
@@ -46,7 +48,7 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            INSERT OR IGNORE INTO config VALUES ('daily_limit', '2');
+            INSERT OR IGNORE INTO config VALUES ('daily_minutes', '60');
         """)
 
 def cfg(key):
@@ -88,35 +90,40 @@ def fmt_dur(secs):
 def now_str():
     return datetime.now().strftime("%I:%M %p")
 
-def breaks_today(uid):
+def minutes_used_today(uid):
+    """Total completed + active break minutes used today."""
     midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = q(
-        "SELECT id FROM breaks WHERE employee_id=? AND created_at>=? "
-        "AND status NOT IN ('forfeited','denied')",
+        "SELECT requested_mins, duration_sec, status FROM breaks "
+        "WHERE employee_id=? AND created_at>=? AND status NOT IN ('forfeited','cancelled','denied')",
         uid, midnight
     )
-    return len(rows)
+    total = 0
+    for r in rows:
+        if r["status"] == "completed" and r["duration_sec"]:
+            total += r["duration_sec"] / 60
+        elif r["status"] in ("on_break", "queued", "notified"):
+            total += r["requested_mins"]
+    return total
+
+def minutes_remaining_today(uid):
+    limit = int(cfg("daily_minutes"))
+    used = minutes_used_today(uid)
+    return max(0, limit - used)
 
 def active_break():
     return q("SELECT * FROM breaks WHERE status='on_break'", one=True)
 
 def next_queued():
-    return q(
-        "SELECT * FROM breaks WHERE status='queued' ORDER BY id LIMIT 1",
-        one=True
-    )
+    return q("SELECT * FROM breaks WHERE status='queued' ORDER BY id LIMIT 1", one=True)
 
 def queue_count():
-    return len(q(
-        "SELECT id FROM breaks WHERE status IN ('queued','notified')"
-    ))
+    return len(q("SELECT id FROM breaks WHERE status IN ('queued','notified')"))
 
-# ── DM + Channel helpers ──────────────────────────────────────────────────────
+# ── Messaging helpers ─────────────────────────────────────────────────────────
 def dm(text):
     try:
-        app.client.chat_postMessage(
-            channel=MANAGER_USER_ID, text=text, mrkdwn=True
-        )
+        app.client.chat_postMessage(channel=MANAGER_USER_ID, text=text, mrkdwn=True)
     except Exception as e:
         print(f"[DM error] {e}")
 
@@ -128,15 +135,8 @@ def post(text, blocks=None):
         r = app.client.chat_postMessage(**kw)
         return r["ts"]
     except Exception as e:
-        err = str(e)
-        print(f"[post error] {err}")
-        try:
-            app.client.chat_postMessage(
-                channel=MANAGER_USER_ID,
-                text=f"⚠️ *Bot channel post failed:* `{err}`\nMake sure the bot is invited: `/invite @Break Bot` in the channel."
-            )
-        except Exception:
-            pass
+        print(f"[post error] {e}")
+        dm(f"⚠️ *Bot failed to post to channel:* `{e}`\nMake sure bot is invited: `/invite @Break Bot`")
         return None
 
 def update_msg(ts, text, blocks=None):
@@ -148,10 +148,13 @@ def update_msg(ts, text, blocks=None):
     except Exception as e:
         print(f"[update error] {e}")
 
-def ephemeral(user, text):
-    app.client.chat_postEphemeral(
-        channel=BREAK_CHANNEL_ID, user=user, text=text
-    )
+def ephemeral(user, text, mrkdwn=True):
+    try:
+        app.client.chat_postEphemeral(
+            channel=BREAK_CHANNEL_ID, user=user, text=text, mrkdwn=mrkdwn
+        )
+    except Exception as e:
+        print(f"[ephemeral error] {e}")
 
 # ── Break lifecycle ───────────────────────────────────────────────────────────
 def start_break(brk_id):
@@ -159,56 +162,77 @@ def start_break(brk_id):
     if not brk:
         return
     run("UPDATE breaks SET status='on_break', started_at=unixepoch() WHERE id=?", brk_id)
-    name = username(brk["employee_id"])
+    uid  = brk["employee_id"]
+    name = username(uid)
+    mins = brk["requested_mins"]
 
-    ts = post(
-        f"🟡 {name} is on break!",
-        blocks=[{
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"🟡 *{name}* is now on a *15-minute break* _(started {now_str()})_\n"
-                    f"⏳ They'll be notified when time is up."
-                )
-            }
-        }]
-    )
-    if ts:
-        run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
-
-    used = breaks_today(brk["employee_id"])
-    qc = queue_count()
-    dm(
-        f"🟡 *Break Started*\n"
-        f"  • *Employee:* {name}\n"
-        f"  • *Time:* {now_str()}\n"
-        f"  • *Breaks used today:* {used}/{cfg('daily_limit')}\n"
-        f"  • *Queue behind them:* {qc} person(s)"
-    )
-
-    t = threading.Timer(BREAK_DURATION_SECS, end_break, args=[brk_id])
-    t.daemon = True
-    t.start()
-    active_timers[brk_id] = t
-
-
-def end_break(brk_id):
-    brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
-    if not brk or brk["status"] != "on_break":
-        return
-    active_timers.pop(brk_id, None)
-    name = username(brk["employee_id"])
-
+    # ── Channel message: minimal, just tag + end early button ──
     blocks = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"⏰ *{name}*, your 15-minute break is over!\n"
-                    f"Please click the button below when you're back. 👇"
-                )
+                "text": f"🟡 <@{uid}> is currently on a break."
+            }
+        },
+        {
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🔚 End Break Early"},
+                "style": "danger",
+                "action_id": "end_early",
+                "value": str(brk_id)
+            }]
+        }
+    ]
+    ts = post(f"🟡 <@{uid}> is on a break.", blocks=blocks)
+    if ts:
+        run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
+
+    # ── Private message to employee only ──
+    remaining = minutes_remaining_today(uid)
+    ephemeral(
+        uid,
+        f"✅ Your break has started!\n"
+        f"  • *Duration:* {mins} min\n"
+        f"  • *Minutes remaining after this:* {remaining - mins:.0f} min\n"
+        f"You'll be tagged here when time is up. 🔔"
+    )
+
+    # ── DM manager with full details ──
+    qc = queue_count()
+    dm(
+        f"🟡 *Break Started*\n"
+        f"  • *Employee:* {name}\n"
+        f"  • *Duration:* {mins} min\n"
+        f"  • *Time:* {now_str()}\n"
+        f"  • *Minutes used today:* {minutes_used_today(uid):.0f}/{cfg('daily_minutes')}\n"
+        f"  • *Queue:* {qc} person(s) waiting"
+    )
+
+    t = threading.Timer(mins * 60, end_break, args=[brk_id])
+    t.daemon = True
+    t.start()
+    active_timers[brk_id] = t
+
+
+def end_break(brk_id, early=False):
+    brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
+    if not brk or brk["status"] != "on_break":
+        return
+    active_timers.pop(brk_id, None)
+    uid  = brk["employee_id"]
+    name = username(uid)
+
+    # ── Update channel message: tag person + I'm Back button ──
+    label = "ended their break early" if early else "break time is up"
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"⏰ <@{uid}> — time to head back! Click the button below. 👇"
             }
         },
         {
@@ -222,16 +246,15 @@ def end_break(brk_id):
             }]
         }
     ]
-
     if brk["channel_msg_ts"]:
-        update_msg(brk["channel_msg_ts"], f"⏰ {name}, your break is over!", blocks=blocks)
+        update_msg(brk["channel_msg_ts"], f"⏰ <@{uid}> break time is up!", blocks=blocks)
     else:
-        post(f"⏰ {name}, break time's up!", blocks=blocks)
+        post(f"⏰ <@{uid}> break time is up!", blocks=blocks)
 
     dm(
-        f"⏰ *Break Timer Ended*\n"
+        f"⏰ *Break Timer Ended{'(early)' if early else ''}*\n"
         f"  • *Employee:* {name}\n"
-        f"  • *Waiting for them to click 'I'm Back'*\n"
+        f"  • *Waiting for 'I'm Back' click*\n"
         f"  • *Time:* {now_str()}"
     )
 
@@ -243,37 +266,49 @@ def complete_break(brk_id, clicked_by):
     if brk["employee_id"] != clicked_by:
         ephemeral(clicked_by, "⚠️ Only the person on break can click this.")
         return
-    if brk["status"] not in ("on_break",):
+    if brk["status"] != "on_break":
         ephemeral(clicked_by, "⚠️ This break is no longer active.")
         return
 
-    ended = time.time()
-    started = brk["started_at"] or ended
+    ended    = time.time()
+    started  = brk["started_at"] or ended
     duration = ended - started
     run(
         "UPDATE breaks SET status='completed', ended_at=?, duration_sec=? WHERE id=?",
         ended, duration, brk_id
     )
 
-    name = username(brk["employee_id"])
-    dur_str = fmt_dur(duration)
+    uid      = brk["employee_id"]
+    name     = username(uid)
+    dur_str  = fmt_dur(duration)
+    remaining = minutes_remaining_today(uid)
 
+    # ── Update channel message: clean minimal ──
     if brk["channel_msg_ts"]:
         update_msg(
             brk["channel_msg_ts"],
-            f"✅ {name} is back!",
+            f"✅ <@{uid}> is back!",
             blocks=[{
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"✅ *{name}* is back after *{dur_str}*. 👋"}
+                "text": {"type": "mrkdwn", "text": f"✅ <@{uid}> is back. 👋"}
             }]
         )
 
-    used = breaks_today(brk["employee_id"])
+    # ── Private message to employee ──
+    ephemeral(
+        uid,
+        f"👋 Welcome back!\n"
+        f"  • *Break duration:* {dur_str}\n"
+        f"  • *Minutes remaining today:* {remaining:.0f} min"
+    )
+
+    # ── DM manager ──
     dm(
         f"✅ *Employee Returned*\n"
         f"  • *Employee:* {name}\n"
         f"  • *Actual break time:* {dur_str}\n"
-        f"  • *Breaks used today:* {used}/{cfg('daily_limit')}\n"
+        f"  • *Minutes used today:* {minutes_used_today(uid):.0f}/{cfg('daily_minutes')}\n"
+        f"  • *Minutes remaining today:* {remaining:.0f} min\n"
         f"  • *Returned at:* {now_str()}"
     )
 
@@ -286,22 +321,18 @@ def notify_next(brk_id):
     if not brk:
         print(f"[notify_next] break not found!")
         return
-    run(
-        "UPDATE breaks SET status='notified', notified_at=unixepoch() WHERE id=?",
-        brk_id
-    )
-    name = username(brk["employee_id"])
-    print(f"[notify_next] posting to channel {BREAK_CHANNEL_ID} for {name}")
+    run("UPDATE breaks SET status='notified', notified_at=unixepoch() WHERE id=?", brk_id)
+    uid  = brk["employee_id"]
+    name = username(uid)
+    print(f"[notify_next] posting to channel for {name}")
 
+    # ── Channel: tag them + Start button ──
     blocks = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"🟢 It's your turn, *{name}*!\n"
-                    f"Click *Start My Break* within *2 minutes* or your spot will be given away. ⏳"
-                )
+                "text": f"🟢 <@{uid}> — it's your turn! Click below within *2 minutes* or your spot will be skipped. ⏳"
             }
         },
         {
@@ -315,7 +346,7 @@ def notify_next(brk_id):
             }]
         }
     ]
-    ts = post(f"🟢 {name}, it's your turn!", blocks=blocks)
+    ts = post(f"🟢 <@{uid}> it's your turn!", blocks=blocks)
     print(f"[notify_next] post returned ts={ts}")
     if ts:
         run("UPDATE breaks SET channel_msg_ts=? WHERE id=?", ts, brk_id)
@@ -339,25 +370,23 @@ def forfeit_spot(brk_id):
         return
     active_timers.pop(brk_id, None)
     run("UPDATE breaks SET status='forfeited' WHERE id=?", brk_id)
-    name = username(brk["employee_id"])
+    uid  = brk["employee_id"]
+    name = username(uid)
 
     if brk["channel_msg_ts"]:
         update_msg(
             brk["channel_msg_ts"],
-            f"❌ {name} didn't respond in time.",
+            f"❌ <@{uid}> didn't respond in time.",
             blocks=[{
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"❌ *{name}* didn't respond within 2 minutes and lost their queue spot."
-                }
+                "text": {"type": "mrkdwn", "text": f"❌ <@{uid}> didn't respond within 2 minutes — spot skipped."}
             }]
         )
 
     dm(
         f"❌ *Queue Spot Forfeited*\n"
         f"  • *Employee:* {name}\n"
-        f"  • *Reason:* No response within 2 minutes\n"
+        f"  • *Reason:* No response in 2 minutes\n"
         f"  • *Time:* {now_str()}"
     )
     promote_queue()
@@ -370,53 +399,66 @@ def promote_queue():
     if nxt:
         notify_next(nxt["id"])
     else:
-        post("✅ Break slot is open! Type `/break` to request one.")
+        post("✅ Break slot is open! Type `/break [minutes]` to request one.")
 
 
-# ── Slash Commands ────────────────────────────────────────────────────────────
+# ── Slash command: /break [minutes] ──────────────────────────────────────────
 @app.command("/break")
 def handle_break(ack, body):
     ack()
-    user = body["user_id"]
+    user    = body["user_id"]
+    channel = body["channel_id"]
 
-    if body.get("channel_id") != BREAK_CHANNEL_ID:
+    if channel != BREAK_CHANNEL_ID:
         app.client.chat_postEphemeral(
-            channel=body["channel_id"],
-            user=user,
+            channel=channel, user=user,
             text=f"⚠️ Please use `/break` in <#{BREAK_CHANNEL_ID}>."
         )
         return
 
-    limit = int(cfg("daily_limit"))
-    used = breaks_today(user)
-    if used >= limit:
+    # Parse minutes from command text, default to 15
+    text = body.get("text", "").strip()
+    if text.isdigit() and int(text) > 0:
+        mins = int(text)
+    elif text == "":
+        mins = 15
+    else:
+        ephemeral(user, "Usage: `/break 15` — request a 15-minute break. Number must be a positive whole number.")
+        return
+
+    # Check remaining minutes
+    remaining = minutes_remaining_today(user)
+    if mins > remaining:
         ephemeral(
             user,
-            f"⛔ You've used all *{limit}* of your breaks for today. They reset at midnight! 🌙"
+            f"⛔ You only have *{remaining:.0f} minutes* left today but requested *{mins} min*.\n"
+            f"Try `/break {int(remaining)}` or less. Minutes reset at midnight! 🌙"
         )
         return
 
+    # Check if already in queue
     existing = q(
         "SELECT id FROM breaks WHERE employee_id=? AND status IN ('queued','notified','on_break')",
         user, one=True
     )
     if existing:
-        ephemeral(user, "⚠️ You already have an active break request or are in the queue!")
+        ephemeral(user, "⚠️ You already have an active break or are in the queue!")
         return
 
     name = username(user)
-    print(f"[/break] user={user} name={name} active={active_break()} qc={queue_count()}")
-    bid = run("INSERT INTO breaks (employee_id, status) VALUES (?,?)", user, "queued")
+    print(f"[/break] user={user} name={name} mins={mins} active={active_break()} qc={queue_count()}")
+    bid = run("INSERT INTO breaks (employee_id, status, requested_mins) VALUES (?,?,?)", user, "queued", mins)
 
     active = active_break()
-    qc = queue_count() - 1  # subtract self
+    qc     = queue_count() - 1  # subtract self just inserted
 
     if active is None and qc == 0:
         dm(
             f"📥 *Break Requested*\n"
             f"  • *Employee:* {name}\n"
+            f"  • *Duration:* {mins} min\n"
             f"  • *Slot:* Free — notifying now\n"
-            f"  • *Breaks used today:* {used + 1}/{limit}\n"
+            f"  • *Minutes used today:* {minutes_used_today(user):.0f}/{cfg('daily_minutes')}\n"
             f"  • *Time:* {now_str()}"
         )
         notify_next(bid)
@@ -424,39 +466,43 @@ def handle_break(ack, body):
         pos = (1 if active else 0) + qc + 1
         ephemeral(
             user,
-            f"⏳ Added to the queue! You're *#{pos}* in line. I'll ping you when it's your turn. 🎯"
+            f"⏳ You're *#{pos}* in the queue for a *{mins}-min* break.\n"
+            f"I'll tag you here when it's your turn! 🎯"
         )
         dm(
             f"📥 *Break Requested (Queued)*\n"
             f"  • *Employee:* {name}\n"
+            f"  • *Duration:* {mins} min\n"
             f"  • *Queue position:* #{pos}\n"
-            f"  • *Breaks used today:* {used + 1}/{limit}\n"
+            f"  • *Minutes used today:* {minutes_used_today(user):.0f}/{cfg('daily_minutes')}\n"
             f"  • *Time:* {now_str()}"
         )
 
 
-@app.command("/setlimit")
-def handle_setlimit(ack, body):
+# ── Slash command: /setminutes N ─────────────────────────────────────────────
+@app.command("/setminutes")
+def handle_setminutes(ack, body):
     ack()
     user = body["user_id"]
     if user != MANAGER_USER_ID:
         app.client.chat_postEphemeral(
             channel=body["channel_id"], user=user,
-            text="⛔ Only the manager can change the break limit."
+            text="⛔ Only the manager can change the break allowance."
         )
         return
     text = body.get("text", "").strip()
     if not text.isdigit() or int(text) < 1:
         app.client.chat_postEphemeral(
             channel=body["channel_id"], user=user,
-            text="Usage: `/setlimit 3`  — sets the daily break limit per employee."
+            text="Usage: `/setminutes 60` — sets the daily break allowance to 60 minutes per employee."
         )
         return
-    set_cfg("daily_limit", text)
-    post(f"📢 Daily break limit updated to *{text} break(s) per employee* per day.")
-    dm(f"✏️ You updated the daily break limit to *{text}/person/day* at {now_str()}.")
+    set_cfg("daily_minutes", text)
+    post(f"📢 Daily break allowance updated to *{text} minutes per employee* per day.")
+    dm(f"✏️ You updated the daily break allowance to *{text} min/person/day* at {now_str()}.")
 
 
+# ── Slash command: /resetbreaks ───────────────────────────────────────────────
 @app.command("/resetbreaks")
 def handle_reset(ack, body):
     ack()
@@ -469,13 +515,13 @@ def handle_reset(ack, body):
         return
     midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     run(
-        "DELETE FROM breaks WHERE status IN ('queued','forfeited','completed','denied') "
-        "AND created_at >= ?", midnight
+        "DELETE FROM breaks WHERE status NOT IN ('on_break') AND created_at >= ?", midnight
     )
-    post("🔄 Break counts have been manually reset by the manager. Everyone starts fresh!")
-    dm(f"🔄 You manually reset all break counts at {now_str()}.")
+    post("🔄 Break minutes have been manually reset by the manager. Everyone starts fresh!")
+    dm(f"🔄 You manually reset all break minutes at {now_str()}.")
 
 
+# ── Slash command: /clearqueue ────────────────────────────────────────────────
 @app.command("/clearqueue")
 def handle_clearqueue(ack, body):
     ack()
@@ -486,33 +532,81 @@ def handle_clearqueue(ack, body):
             text="⛔ Only the manager can use this command."
         )
         return
-    # Cancel all active timers
     for t in list(active_timers.values()):
         try:
             t.cancel()
         except Exception:
             pass
     active_timers.clear()
-    # Clear all active/stuck breaks
-    run(
-        "UPDATE breaks SET status='cancelled' WHERE status IN ('queued','notified','on_break')"
-    )
+    run("UPDATE breaks SET status='cancelled' WHERE status IN ('queued','notified','on_break')")
     app.client.chat_postEphemeral(
         channel=body["channel_id"], user=user,
-        text="🧹 All active breaks and queue entries have been cleared!"
+        text="🧹 All active breaks and queue entries cleared!"
     )
-    try:
-        post("🧹 Break queue has been cleared by the manager. Use `/break` to start fresh!")
-    except Exception as e:
-        print(f"[clearqueue post error] {e}")
+    post("🧹 Break queue cleared by manager. Use `/break [minutes]` to start fresh!")
     dm(f"🧹 You cleared the entire break queue at {now_str()}.")
 
 
-@app.command("/mybreakid")
-def handle_mybreakid(ack, body):
-    """Debug: shows the channel ID where command was typed."""
+# ── Slash command: /breakstatus ───────────────────────────────────────────────
+@app.command("/breakstatus")
+def handle_status(ack, body):
     ack()
     user = body["user_id"]
+    if user != MANAGER_USER_ID:
+        app.client.chat_postEphemeral(
+            channel=body["channel_id"], user=user,
+            text="⛔ Only the manager can view the full break status."
+        )
+        return
+
+    active  = active_break()
+    queued  = q("SELECT * FROM breaks WHERE status IN ('queued','notified') ORDER BY id")
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    today_rows = q(
+        "SELECT DISTINCT employee_id FROM breaks WHERE created_at>=? "
+        "AND status NOT IN ('forfeited','cancelled','denied')",
+        midnight
+    )
+    limit = cfg("daily_minutes")
+    lines = [f"📊 *Break Dashboard — {datetime.now().strftime('%b %d, %Y %I:%M %p')}*\n"]
+
+    if active:
+        elapsed   = int(time.time() - (active["started_at"] or time.time()))
+        remaining = max(0, active["requested_mins"] * 60 - elapsed)
+        lines.append(f"🟡 *On Break:* <@{active['employee_id']}> — _{fmt_dur(remaining)} remaining_")
+    else:
+        lines.append("🟢 *Break Slot:* Available")
+
+    if queued:
+        lines.append(f"\n👥 *Queue ({len(queued)}):*")
+        for i, bq in enumerate(queued, 1):
+            icon = "🔔" if bq["status"] == "notified" else "⏳"
+            lines.append(f"  {icon} #{i}: {username(bq['employee_id'])} ({bq['requested_mins']} min)")
+    else:
+        lines.append("\n👥 *Queue:* Empty")
+
+    if today_rows:
+        lines.append(f"\n📅 *Today's Usage (limit: {limit} min/person):*")
+        for row in today_rows:
+            used = minutes_used_today(row["employee_id"])
+            rem  = max(0, int(limit) - used)
+            pct  = min(int(used / int(limit) * 10), 10)
+            bar  = "🟩" * pct + "⬜" * (10 - pct)
+            lines.append(f"  {bar} {username(row['employee_id'])}: {used:.0f}/{limit} min ({rem:.0f} left)")
+    else:
+        lines.append(f"\n📅 *Today's Usage:* None yet (limit {limit} min/person)")
+
+    app.client.chat_postEphemeral(
+        channel=body["channel_id"], user=user,
+        text="\n".join(lines), mrkdwn=True
+    )
+
+
+# ── Slash command: /mybreakid (debug) ────────────────────────────────────────
+@app.command("/mybreakid")
+def handle_mybreakid(ack, body):
+    ack()
+    user    = body["user_id"]
     channel = body["channel_id"]
     app.client.chat_postEphemeral(
         channel=channel, user=user,
@@ -525,72 +619,13 @@ def handle_mybreakid(ack, body):
     )
 
 
-@app.command("/breakstatus")
-def handle_status(ack, body):
-    ack()
-    user = body["user_id"]
-    if user != MANAGER_USER_ID:
-        app.client.chat_postEphemeral(
-            channel=body["channel_id"], user=user,
-            text="⛔ Only the manager can view the full break status."
-        )
-        return
-
-    active = active_break()
-    queued = q(
-        "SELECT * FROM breaks WHERE status IN ('queued','notified') ORDER BY id"
-    )
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    today_rows = q(
-        "SELECT employee_id, COUNT(*) as cnt FROM breaks "
-        "WHERE created_at>=? AND status NOT IN ('forfeited','denied') "
-        "GROUP BY employee_id",
-        midnight
-    )
-    limit = cfg("daily_limit")
-    lines = [f"📊 *Break Dashboard — {datetime.now().strftime('%b %d, %Y %I:%M %p')}*\n"]
-
-    if active:
-        elapsed = int(time.time() - (active["started_at"] or time.time()))
-        remaining = max(0, BREAK_DURATION_SECS - elapsed)
-        lines.append(
-            f"🟡 *On Break:* {username(active['employee_id'])} "
-            f"— _{fmt_dur(remaining)} remaining_"
-        )
-    else:
-        lines.append("🟢 *Break Slot:* Available")
-
-    if queued:
-        lines.append(f"\n👥 *Queue ({len(queued)}):*")
-        for i, bq in enumerate(queued, 1):
-            icon = "🔔" if bq["status"] == "notified" else "⏳"
-            lines.append(f"  {icon} #{i}: {username(bq['employee_id'])}")
-    else:
-        lines.append("\n👥 *Queue:* Empty")
-
-    if today_rows:
-        lines.append(f"\n📅 *Today's Breaks (limit {limit}/person):*")
-        for row in today_rows:
-            bar = "🟩" * int(row["cnt"]) + "⬜" * max(0, int(limit) - int(row["cnt"]))
-            lines.append(f"  {bar} {username(row['employee_id'])}: {row['cnt']}/{limit}")
-    else:
-        lines.append(f"\n📅 *Today's Breaks:* None yet (limit {limit}/person)")
-
-    app.client.chat_postEphemeral(
-        channel=body["channel_id"],
-        user=user,
-        text="\n".join(lines),
-        mrkdwn=True
-    )
-
-
-# ── Button actions ────────────────────────────────────────────────────────────
+# ── Button: Start My Break (from queue) ──────────────────────────────────────
 @app.action("start_queued_break")
 def handle_start_queued(ack, body, action):
     ack()
-    user = body["user"]["id"]
+    user   = body["user"]["id"]
     brk_id = int(action["value"])
-    brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
+    brk    = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
     if not brk:
         ephemeral(user, "⚠️ Break not found.")
         return
@@ -607,10 +642,34 @@ def handle_start_queued(ack, body, action):
     start_break(brk_id)
 
 
+# ── Button: End Break Early ───────────────────────────────────────────────────
+@app.action("end_early")
+def handle_end_early(ack, body, action):
+    ack()
+    user   = body["user"]["id"]
+    brk_id = int(action["value"])
+    brk    = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
+    if not brk:
+        ephemeral(user, "⚠️ Break not found.")
+        return
+    if brk["employee_id"] != user:
+        ephemeral(user, "⚠️ Only the person on break can end it early.")
+        return
+    if brk["status"] != "on_break":
+        ephemeral(user, "⚠️ This break is no longer active.")
+        return
+    # Cancel the timer
+    t = active_timers.pop(brk_id, None)
+    if t:
+        t.cancel()
+    end_break(brk_id, early=True)
+
+
+# ── Button: I'm Back ─────────────────────────────────────────────────────────
 @app.action("im_back")
 def handle_im_back(ack, body, action):
     ack()
-    user = body["user"]["id"]
+    user   = body["user"]["id"]
     brk_id = int(action["value"])
     complete_break(brk_id, user)
 
@@ -618,14 +677,16 @@ def handle_im_back(ack, body, action):
 # ── Midnight scheduler ────────────────────────────────────────────────────────
 def midnight_reset():
     try:
+        mins = cfg("daily_minutes")
         post(
-            f"🌅 Good morning! Break counts have reset.\n"
-            f"Each employee gets *{cfg('daily_limit')} break(s)* today. Type `/break` to use one!"
+            f"🌅 Good morning! Break minutes have reset.\n"
+            f"Each employee has *{mins} minutes* of breaks available today. "
+            f"Type `/break 15` to use some!"
         )
         dm(
             f"🌅 *Daily Reset*\n"
-            f"  • Break counts reset at midnight\n"
-            f"  • Current limit: *{cfg('daily_limit')}/person/day*"
+            f"  • Break minutes reset at midnight\n"
+            f"  • Current allowance: *{mins} min/person/day*"
         )
     except Exception as e:
         print(f"[midnight reset error] {e}")
@@ -640,5 +701,5 @@ def run_scheduler():
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print("🚀 Break Queue Bot v2 running...")
+    print("🚀 Break Queue Bot v3 running...")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
