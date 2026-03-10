@@ -67,12 +67,9 @@ def q(sql, *args, one=False):
 
 def run(sql, *args):
     with sqlite3.connect(DB_PATH) as c:
-        c.execute(sql, args)
+        cur = c.execute(sql, args)
         c.commit()
-
-def last_id():
-    with sqlite3.connect(DB_PATH) as c:
-        return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return cur.lastrowid
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def username(uid):
@@ -409,8 +406,7 @@ def handle_break(ack, body):
 
     name = username(user)
     print(f"[/break] user={user} name={name} active={active_break()} qc={queue_count()}")
-    run("INSERT INTO breaks (employee_id, status) VALUES (?,?)", user, "queued")
-    bid = last_id()
+    bid = run("INSERT INTO breaks (employee_id, status) VALUES (?,?)", user, "queued")
 
     active = active_break()
     qc = queue_count() - 1  # subtract self
