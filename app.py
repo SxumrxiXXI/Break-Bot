@@ -461,6 +461,55 @@ def handle_reset(ack, body):
     dm(f"🔄 You manually reset all break counts at {now_str()}.")
 
 
+@app.command("/clearqueue")
+def handle_clearqueue(ack, body):
+    ack()
+    user = body["user_id"]
+    if user != MANAGER_USER_ID:
+        app.client.chat_postEphemeral(
+            channel=body["channel_id"], user=user,
+            text="⛔ Only the manager can use this command."
+        )
+        return
+    # Cancel all active timers
+    for t in list(active_timers.values()):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    active_timers.clear()
+    # Clear all active/stuck breaks
+    run(
+        "UPDATE breaks SET status='cancelled' WHERE status IN ('queued','notified','on_break')"
+    )
+    app.client.chat_postEphemeral(
+        channel=body["channel_id"], user=user,
+        text="🧹 All active breaks and queue entries have been cleared!"
+    )
+    try:
+        post("🧹 Break queue has been cleared by the manager. Use `/break` to start fresh!")
+    except Exception as e:
+        print(f"[clearqueue post error] {e}")
+    dm(f"🧹 You cleared the entire break queue at {now_str()}.")
+
+
+@app.command("/mybreakid")
+def handle_mybreakid(ack, body):
+    """Debug: shows the channel ID where command was typed."""
+    ack()
+    user = body["user_id"]
+    channel = body["channel_id"]
+    app.client.chat_postEphemeral(
+        channel=channel, user=user,
+        text=(
+            f"🔍 *Debug Info*\n"
+            f"  • This channel ID: `{channel}`\n"
+            f"  • Configured BREAK_CHANNEL_ID: `{BREAK_CHANNEL_ID}`\n"
+            f"  • Match: {'✅ Yes' if channel == BREAK_CHANNEL_ID else '❌ No — update your Railway variable!'}"
+        )
+    )
+
+
 @app.command("/breakstatus")
 def handle_status(ack, body):
     ack()
