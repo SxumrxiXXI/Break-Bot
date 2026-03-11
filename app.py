@@ -490,7 +490,30 @@ def forfeit_spot(brk_id):
     promote_queue()
 
 
-def promote_queue():
+def estimated_turn_time(pos):
+    """
+    Estimate how many minutes until this queue position gets their turn.
+    pos=1 means they're next after the current on-break person.
+    Adds up: remaining time of current break + requested_mins of everyone ahead in queue.
+    """
+    wait_mins = 0.0
+
+    active = active_break()
+    if active:
+        elapsed   = time.time() - (active["started_at"] or time.time())
+        remaining = max(0, active["requested_mins"] * 60 - elapsed)
+        wait_mins += remaining / 60
+
+    # Everyone ahead in queue (ordered by id, excluding notified who are about to start)
+    ahead = q(
+        "SELECT requested_mins FROM breaks WHERE status IN ('queued','notified') "
+        "ORDER BY id LIMIT ?", pos - 1
+    )
+    for r in ahead:
+        wait_mins += r["requested_mins"]
+
+    eta = datetime.now(LOCAL_TZ) + timedelta(minutes=wait_mins)
+    return int(wait_mins), eta.strftime("%I:%M %p")
     if active_break():
         return
     nxt = next_queued()
@@ -568,10 +591,13 @@ def handle_break(ack, body):
     else:
         # Queue them — announce position PUBLICLY in channel
         pos = (1 if active else 0) + qc + 1
+        wait_mins, eta = estimated_turn_time(pos)
         post(f"⏳ <@{user}> is *{ordinal(pos)}* in the break queue.")
         ephemeral(
             user,
             f"⏳ You're *{ordinal(pos)}* in the queue for a *{mins}-min* break.\n"
+            f"  • *Estimated wait:* ~{wait_mins} min\n"
+            f"  • *Estimated turn:* {eta}\n"
             f"I'll tag you here when it's your turn! 🎯"
         )
         dm(
@@ -579,6 +605,7 @@ def handle_break(ack, body):
             f"  • *Employee:* {name}\n"
             f"  • *Duration:* {mins} min\n"
             f"  • *Queue position:* {ordinal(pos)}\n"
+            f"  • *Est. turn time:* {eta} (~{wait_mins} min wait)\n"
             f"  • *Minutes used today:* {int(minutes_used_today(user))}/{cfg('daily_minutes')}\n"
             f"  • *Time:* {now_str()}"
         )
