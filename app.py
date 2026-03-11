@@ -13,9 +13,12 @@ Changes from v3:
 """
 
 import os, sqlite3, threading, time, schedule
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+LOCAL_TZ = ZoneInfo("Africa/Cairo")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BREAK_CHANNEL_ID   = os.environ["BREAK_CHANNEL_ID"]
@@ -94,18 +97,18 @@ def fmt_dur(secs):
     return f"{m} min {s} sec" if m else f"{s} sec"
 
 def now_str():
-    return datetime.now().strftime("%I:%M %p")
+    return datetime.now(LOCAL_TZ).strftime("%I:%M %p")
 
 def return_time_str(mins):
-    """Estimated return time = now + mins."""
-    return (datetime.now() + timedelta(minutes=mins)).strftime("%I:%M %p")
+    """Estimated return time = now + mins, in local timezone."""
+    return (datetime.now(LOCAL_TZ) + timedelta(minutes=mins)).strftime("%I:%M %p")
 
 def ordinal(n):
     return f"{n}{'th' if 11<=n<=13 else {1:'st',2:'nd',3:'rd'}.get(n%10,'th')}"
 
 def minutes_used_today(uid, exclude_id=None):
     """Actual minutes used today — completed breaks use real duration, active uses requested."""
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    midnight = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     rows = q(
         "SELECT id, requested_mins, duration_sec, status FROM breaks "
         "WHERE employee_id=? AND created_at>=? AND status NOT IN ('forfeited','cancelled','denied')",
@@ -559,7 +562,7 @@ def handle_reset(ack, body):
         app.client.chat_postEphemeral(channel=body["channel_id"], user=user,
             text="⛔ Only the manager can reset breaks.")
         return
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    midnight = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     run("DELETE FROM breaks WHERE status NOT IN ('on_break') AND created_at >= ?", midnight)
     post("🔄 Break minutes reset by manager. Everyone starts fresh!")
     dm(f"🔄 You reset all break minutes at {now_str()}.")
@@ -583,7 +586,7 @@ def handle_resetperson(ack, body):
             text="Usage: `/resetperson @employee` — resets that person's break minutes for today.")
         return
     target_uid = match.group(0)
-    midnight   = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    midnight   = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     run(
         "DELETE FROM breaks WHERE employee_id=? AND status NOT IN ('on_break') AND created_at >= ?",
         target_uid, midnight
@@ -628,18 +631,18 @@ def handle_status(ack, body):
 
     active   = active_break()
     queued   = q("SELECT * FROM breaks WHERE status IN ('queued','notified') ORDER BY id")
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    midnight = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     today_uids = q(
         "SELECT DISTINCT employee_id FROM breaks WHERE created_at>=? "
         "AND status NOT IN ('forfeited','cancelled','denied')", midnight
     )
     limit = cfg("daily_minutes")
-    lines = [f"📊 *Break Dashboard — {datetime.now().strftime('%b %d, %Y %I:%M %p')}*\n"]
+    lines = [f"📊 *Break Dashboard — {datetime.now(LOCAL_TZ).strftime('%b %d, %Y %I:%M %p')}*\n"]
 
     if active:
         elapsed   = int(time.time() - (active["started_at"] or time.time()))
         remaining = max(0, active["requested_mins"] * 60 - elapsed)
-        eta       = (datetime.now() + timedelta(seconds=remaining)).strftime("%I:%M %p")
+        eta       = (datetime.now(LOCAL_TZ) + timedelta(seconds=remaining)).strftime("%I:%M %p")
         lines.append(f"🟡 *On Break:* <@{active['employee_id']}> — _{fmt_dur(remaining)} left, est. return {eta}_")
     else:
         lines.append("🟢 *Break Slot:* Available")
@@ -680,10 +683,10 @@ def handle_report(ack, body):
     # Default: today. If "week" passed, show last 7 days
     text = body.get("text", "").strip().lower()
     if text == "week":
-        since = (datetime.now() - timedelta(days=7)).timestamp()
+        since = (datetime.now(LOCAL_TZ) - timedelta(days=7)).timestamp()
         period = "Last 7 Days"
     else:
-        since = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        since = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         period = "Today"
 
     rows = q(
@@ -705,8 +708,8 @@ def handle_report(ack, body):
         rs = r["return_status"] or "on_time"
         summary[uid][rs] += 1
         summary[uid]["total_min"] += (r["duration_sec"] or 0) / 60
-        started = datetime.fromtimestamp(r["started_at"]).strftime("%I:%M %p") if r["started_at"] else "?"
-        ended   = datetime.fromtimestamp(r["ended_at"]).strftime("%I:%M %p") if r["ended_at"] else "?"
+        started = datetime.fromtimestamp(r["started_at"], tz=LOCAL_TZ).strftime("%I:%M %p") if r["started_at"] else "?"
+        ended   = datetime.fromtimestamp(r["ended_at"], tz=LOCAL_TZ).strftime("%I:%M %p") if r["ended_at"] else "?"
         rs_icon = {"early": "🟢", "late": "🔴", "on_time": "✅"}.get(rs, "✅")
         summary[uid]["breaks"].append(
             f"    {rs_icon} {started}→{ended} ({fmt_dur(r['duration_sec'] or 0)}, {r['requested_mins']} min scheduled)"
@@ -835,7 +838,7 @@ def midnight_reset():
         print(f"[midnight reset error] {e}")
 
 def run_scheduler():
-    schedule.every().day.at("00:00").do(midnight_reset)
+    schedule.every().day.at("22:00").do(midnight_reset)  # 22:00 UTC = 00:00 Cairo (UTC+2)
     while True:
         schedule.run_pending()
         time.sleep(30)
