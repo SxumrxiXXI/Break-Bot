@@ -279,12 +279,62 @@ def end_break(brk_id, early=False):
         f"  • *Time:* {now_str()}"
     )
 
+    # Schedule recurring 1-minute reminders until they click I'm Back
+    t = threading.Timer(60, remind_employee_loop, args=[brk_id, 1])
+    t.daemon = True
+    t.start()
+    active_timers[f"remind_{brk_id}"] = t
+
+
+def remind_employee_loop(brk_id, attempt):
+    """DM the employee every minute until they click I'm Back."""
+    brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
+    if not brk or brk["status"] != "on_break":
+        active_timers.pop(f"remind_{brk_id}", None)
+        return
+    active_timers.pop(f"remind_{brk_id}", None)
+
+    uid      = brk["employee_id"]
+    overdue  = attempt  # each attempt = 1 more minute overdue
+
+    try:
+        app.client.chat_postMessage(
+            channel=uid,
+            text=(
+                f"👋 You're *{overdue} minute{'s' if overdue > 1 else ''} overdue* on your break!\n\n"
+                f"Please head to <#{BREAK_CHANNEL_ID}> and click *✅ I'm Back!* to let the team know you're back. 🙏"
+            ),
+            mrkdwn=True
+        )
+    except Exception as e:
+        print(f"[remind_employee_loop DM error] {e}")
+
+    # Notify manager on first and every 5th reminder
+    if attempt == 1 or attempt % 5 == 0:
+        dm(
+            f"⚠️ *Employee Still Not Back*\n"
+            f"  • *Employee:* {username(uid)}\n"
+            f"  • *Overdue by:* {overdue} minute{'s' if overdue > 1 else ''}\n"
+            f"  • *Time:* {now_str()}"
+        )
+
+    # Schedule next reminder in 1 minute
+    t = threading.Timer(60, remind_employee_loop, args=[brk_id, attempt + 1])
+    t.daemon = True
+    t.start()
+    active_timers[f"remind_{brk_id}"] = t
+
 
 def _finish_break(brk_id, uid, early=False):
     """Shared logic for completing a break (early or on-time via I'm Back)."""
     brk = q("SELECT * FROM breaks WHERE id=?", brk_id, one=True)
     if not brk or brk["status"] != "on_break":
         return False
+
+    # Cancel the 1-min reminder timer if it's still pending
+    remind_timer = active_timers.pop(f"remind_{brk_id}", None)
+    if remind_timer:
+        remind_timer.cancel()
 
     ended    = time.time()
     started  = brk["started_at"] or ended
@@ -808,6 +858,10 @@ def handle_end_early(ack, body, action):
     t = active_timers.pop(brk_id, None)
     if t:
         t.cancel()
+    # Also cancel any pending reminder
+    remind_t = active_timers.pop(f"remind_{brk_id}", None)
+    if remind_t:
+        remind_t.cancel()
     if _finish_break(brk_id, user, early=True):
         promote_queue()
 
