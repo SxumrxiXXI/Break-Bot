@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Break Queue Bot v7
+Break Queue Bot v8
 Changes:
 - Multi-channel support: Uses BREAK_CHANNEL_IDS
-- Database tracks 'channel_id' so the bot replies in the correct channel
-- DMs only send to the PRIMARY manager
+- Multiple managers: Uses MANAGER_USER_IDS
+- DMs only send to the PRIMARY manager (first in list)
+- Manager commands ONLY output to the channel they were typed in
+- "Break slot is open" only posts to the channel of the person who just finished
+- Added /setused @user [mins] to manually adjust an employee's used minutes
 """
 
-import os, sqlite3, threading, time, schedule
+import os, sqlite3, threading, time, schedule, re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from slack_bolt import App
@@ -16,7 +19,6 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 LOCAL_TZ = ZoneInfo("Africa/Cairo")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Parse comma-separated lists of IDs
 BREAK_CHANNEL_IDS  = [cid.strip() for cid in os.environ.get("BREAK_CHANNEL_IDS", "").split(",") if cid.strip()]
 MANAGER_USER_IDS   = [uid.strip() for uid in os.environ.get("MANAGER_USER_IDS", "").split(",") if uid.strip()]
 
@@ -51,7 +53,6 @@ def init_db():
             );
             INSERT OR IGNORE INTO config VALUES ('daily_minutes', '60');
         """)
-        # DB Upgrades
         try:
             c.execute("ALTER TABLE breaks ADD COLUMN return_status TEXT")
             c.commit()
@@ -140,7 +141,6 @@ def queue_count():
     return len(q("SELECT id FROM breaks WHERE status IN ('queued','notified')"))
 
 def get_channel_for_break(brk):
-    """Safely fetch channel_id from break row, falling back to the first allowed channel."""
     if brk and "channel_id" in brk.keys() and brk["channel_id"]:
         return brk["channel_id"]
     return BREAK_CHANNEL_IDS[0] if BREAK_CHANNEL_IDS else ""
@@ -397,7 +397,7 @@ def _finish_break(brk_id, uid, early=False):
         f"  • *Minutes remaining today:* {remaining:.0f} min\n"
         f"  • *Returned at:* {now_str()}"
     )
-    return True
+    return chan # Return channel so promote_queue knows where to post
 
 
 def complete_break(brk_id, clicked_by, channel_id):
@@ -410,8 +410,10 @@ def complete_break(brk_id, clicked_by, channel_id):
     if brk["status"] != "on_break":
         ephemeral(clicked_by, "⚠️ This break is no longer active.", channel_id)
         return
-    if _finish_break(brk_id, clicked_by, early=False):
-        promote_queue()
+    
+    chan = _finish_break(brk_id, clicked_by, early=False)
+    if chan:
+        promote_queue(chan)
 
 
 def notify_next(brk_id):
@@ -489,7 +491,7 @@ def forfeit_spot(brk_id):
         f"  • *Reason:* No response in 2 minutes\n"
         f"  • *Time:* {now_str()}"
     )
-    promote_queue()
+    promote_queue(chan)
 
 
 def estimated_turn_time(pos):
@@ -512,16 +514,15 @@ def estimated_turn_time(pos):
     return int(wait_mins), eta.strftime("%I:%M %p")
 
 
-def promote_queue():
+def promote_queue(fallback_channel=None):
     if active_break():
         return
     nxt = next_queued()
     if nxt:
         notify_next(nxt["id"])
-    else:
-        # Announce queue is open in all allowed channels
-        for c in BREAK_CHANNEL_IDS:
-            post("✅ Break slot is open! Type `/break [minutes]` to request one.", channel=c)
+    elif fallback_channel:
+        # Only posts in the channel where the break just ended
+        post("✅ Break slot is open! Type `/break [minutes]` to request one.", channel=fallback_channel)
 
 
 # ── /break ────────────────────────────────────────────────────────────────────
@@ -570,7 +571,6 @@ def handle_break(ack, body):
     name   = username(user)
     active = active_break()
     
-    # Save the channel_id so the bot knows where to reply later
     bid = run(
         "INSERT INTO breaks (employee_id, status, requested_mins, channel_id) VALUES (?,?,?,?)", 
         user, "queued", mins, channel
@@ -603,6 +603,39 @@ def handle_break(ack, body):
 
 
 # ── Manager Commands ──────────────────────────────────────────────────────────
+@app.command("/setused")
+def handle_setused(ack, body):
+    ack()
+    user    = body["user_id"]
+    channel = body["channel_id"]
+    if user not in MANAGER_USER_IDS:
+        ephemeral(user, "⛔ Only managers can use this command.", channel)
+        return
+
+    text = body.get("text", "").strip()
+    match_uid = re.search(r"U[A-Z0-9]+", text)
+    match_mins = re.search(r"\b\d+\b", text)
+    
+    if not match_uid or not match_mins:
+        ephemeral(user, "Usage: `/setused @employee 15` — sets their used minutes to 15.", channel)
+        return
+        
+    target_uid = match_uid.group(0)
+    new_used = int(match_mins.group(0))
+    current_used = minutes_used_today(target_uid)
+    
+    diff_mins = new_used - current_used
+    if diff_mins != 0:
+        run(
+            "INSERT INTO breaks (employee_id, status, requested_mins, duration_sec, return_status, channel_id) VALUES (?,?,?,?,?,?)",
+            target_uid, "completed", 0, diff_mins * 60, "on_time", channel
+        )
+        
+    name = username(target_uid)
+    ephemeral(user, f"✅ You successfully set *{name}*'s used minutes to *{new_used}* min.", channel)
+    dm(f"⚙️ You manually set *{name}*'s used minutes to {new_used} min at {now_str()}.")
+
+
 @app.command("/setminutes")
 def handle_setminutes(ack, body):
     ack()
@@ -616,8 +649,7 @@ def handle_setminutes(ack, body):
         ephemeral(user, "Usage: `/setminutes 60` — sets daily allowance to 60 min per employee.", channel)
         return
     set_cfg("daily_minutes", text)
-    for c in BREAK_CHANNEL_IDS:
-        post(f"📢 Daily break allowance updated to *{text} minutes per employee* per day.", channel=c)
+    post(f"📢 Daily break allowance updated to *{text} minutes per employee* per day.", channel=channel)
     dm(f"✏️ You updated the daily break allowance to *{text} min/person/day* at {now_str()}.")
 
 
@@ -631,8 +663,7 @@ def handle_reset(ack, body):
         return
     midnight = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     run("DELETE FROM breaks WHERE status NOT IN ('on_break') AND created_at >= ?", midnight)
-    for c in BREAK_CHANNEL_IDS:
-        post("🔄 Break minutes reset by a manager. Everyone starts fresh!", channel=c)
+    post("🔄 Break minutes reset by a manager. Everyone starts fresh!", channel=channel)
     dm(f"🔄 You reset all break minutes at {now_str()}.")
 
 
@@ -645,7 +676,6 @@ def handle_resetperson(ack, body):
         ephemeral(user, "⛔ Only managers can use this command.", channel)
         return
     text = body.get("text", "").strip()
-    import re
     match = re.search(r"U[A-Z0-9]+", text)
     if not match:
         ephemeral(user, "Usage: `/resetperson @employee` — resets that person's break minutes for today.", channel)
@@ -677,8 +707,7 @@ def handle_clearqueue(ack, body):
     active_timers.clear()
     run("UPDATE breaks SET status='cancelled' WHERE status IN ('queued','notified','on_break')")
     ephemeral(user, "🧹 All active breaks and queue entries cleared!", channel)
-    for c in BREAK_CHANNEL_IDS:
-        post("🧹 Break queue cleared by a manager. Use `/break [minutes]` to start fresh!", channel=c)
+    post("🧹 Break queue cleared by a manager. Use `/break [minutes]` to start fresh!", channel=channel)
     dm(f"🧹 You cleared the entire break queue at {now_str()}.")
 
 
@@ -762,9 +791,16 @@ def handle_report(ack, body):
         uid = r["employee_id"]
         if uid not in summary:
             summary[uid] = {"on_time": 0, "early": 0, "late": 0, "total_min": 0.0, "breaks": []}
+        
+        duration = (r["duration_sec"] or 0) / 60
+        summary[uid]["total_min"] += duration
+        
+        if r["requested_mins"] == 0:
+            continue
+            
         rs = r["return_status"] or "on_time"
         summary[uid][rs] += 1
-        summary[uid]["total_min"] += (r["duration_sec"] or 0) / 60
+        
         started = datetime.fromtimestamp(r["started_at"], tz=LOCAL_TZ).strftime("%I:%M %p") if r["started_at"] else "?"
         ended   = datetime.fromtimestamp(r["ended_at"], tz=LOCAL_TZ).strftime("%I:%M %p") if r["ended_at"] else "?"
         rs_icon = {"early": "🟢", "late": "🔴", "on_time": "✅"}.get(rs, "✅")
@@ -809,7 +845,7 @@ def handle_help(ack, body):
         "\n*🔐 Manager-Only Commands:*\n"
         "  • `/breakstatus` — Live dashboard: who's out, queue, everyone's minutes today\n"
         "  • `/breakreport` — Today's full break log (on-time/early/late per person)\n"
-        "  • `/breakreport week` — Same but for the last 7 days\n"
+        "  • `/setused @employee 15` — Manually set an employee's used minutes for today\n"
         "  • `/setminutes 60` — Set daily break allowance in minutes for everyone\n"
         "  • `/resetbreaks` — Wipe today's break minutes, everyone starts fresh\n"
         "  • `/resetperson @employee` — Reset only one person's break minutes today\n"
@@ -821,7 +857,7 @@ def handle_help(ack, body):
     ephemeral(user, text, channel)
 
 
-# ── Button: Start My Break ────────────────────────────────────────────────────
+# ── Button Actions ────────────────────────────────────────────────────────────
 @app.action("start_queued_break")
 def handle_start_queued(ack, body, action):
     ack()
@@ -845,7 +881,6 @@ def handle_start_queued(ack, body, action):
     start_break(brk_id)
 
 
-# ── Button: End Break Early ───────────────────────────────────────────────────
 @app.action("end_early")
 def handle_end_early(ack, body, action):
     ack()
@@ -868,11 +903,12 @@ def handle_end_early(ack, body, action):
     remind_t = active_timers.pop(f"remind_{brk_id}", None)
     if remind_t:
         remind_t.cancel()
-    if _finish_break(brk_id, user, early=True):
-        promote_queue()
+    
+    chan = _finish_break(brk_id, user, early=True)
+    if chan:
+        promote_queue(chan)
 
 
-# ── Button: I'm Back ─────────────────────────────────────────────────────────
 @app.action("im_back")
 def handle_im_back(ack, body, action):
     ack()
@@ -910,5 +946,5 @@ def run_scheduler():
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    print(f"🚀 Break Queue Bot v7 running...")
+    print("🚀 Break Queue Bot v8 running...")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
